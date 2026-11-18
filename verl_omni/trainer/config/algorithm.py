@@ -22,7 +22,26 @@ from verl.trainer.config.algorithm import AlgoConfig, RolloutCorrectionConfig
 
 from verl_omni.trainer.diffusion.diffusion_trainer_utils import OLD_POLICY_DECAY_SCHEDULES
 
-__all__ = ["DiffusionAlgoConfig", "OmniAlgoConfig", "RolloutCorrectionConfig"]
+__all__ = ["DiffusionAlgoConfig", "DiffusionFilterGroupsConfig", "OmniAlgoConfig", "RolloutCorrectionConfig"]
+
+
+@dataclass
+class DiffusionFilterGroupsConfig(BaseConfig):
+    """DAPO dynamic-sampling group filter for diffusion policy-gradient training."""
+
+    # Drop rollout groups without a reward signal from the policy loss.
+    enable: bool = False
+    # Groups whose population reward std is at most this value are dropped; 0.0 drops only exact ties.
+    min_std: float = 0.0
+    # Re-draw replacements for dropped groups before training this step (0 disables).
+    # Requires trainer.v1.sampler.drop_incomplete_groups=true.
+    refill_rounds: int = 0
+
+    def __post_init__(self):
+        if self.min_std < 0:
+            raise ValueError(f"filter_groups.min_std must be non-negative, got {self.min_std}.")
+        if self.refill_rounds < 0:
+            raise ValueError(f"filter_groups.refill_rounds must be non-negative, got {self.refill_rounds}.")
 
 
 @dataclass
@@ -45,6 +64,7 @@ class DiffusionAlgoConfig(BaseConfig):
     train_timestep_count: Optional[int] = None
     adv_mode: str = "continuous"
     paired_preference: bool = False  # True for pair-based algorithms (e.g. DPO)
+    filter_groups: DiffusionFilterGroupsConfig = field(default_factory=DiffusionFilterGroupsConfig)
     rollout_correction: RolloutCorrectionConfig = field(default_factory=RolloutCorrectionConfig)
 
     def __post_init__(self):

@@ -103,6 +103,8 @@ actor_rollout_ref:
       _target_: verl_omni.workers.config.diffusion.DiffusionLossConfig
       loss_mode: ${oc.select:actor_rollout_ref.model.algorithm,flow_grpo}
       clip_ratio: 0.0001
+      clip_ratio_low: null
+      clip_ratio_high: null
       adv_clip_max: 5.0
       mix_beta: 0.5
       ref_kl_coef: 0.0
@@ -707,6 +709,11 @@ algorithm:
   train_timestep_count: null
   adv_mode: continuous
   paired_preference: false
+  filter_groups:
+    _target_: verl_omni.trainer.config.DiffusionFilterGroupsConfig
+    enable: false
+    min_std: 0.0
+    refill_rounds: 0
   rollout_correction:
     _target_: verl.trainer.config.algorithm.RolloutCorrectionConfig
     bypass_mode: false

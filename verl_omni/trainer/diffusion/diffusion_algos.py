@@ -13,6 +13,8 @@
 # limitations under the License.
 """Diffusion-specific loss functions and KL penalties."""
 
+import logging
+import os
 from abc import ABC, abstractmethod
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
@@ -30,6 +32,9 @@ from verl.trainer.ppo.core_algos import get_policy_loss_fn
 from verl.utils import tensordict_utils as tu
 
 from verl_omni.workers.config import DiffusionActorConfig
+
+logger = logging.getLogger(__name__)
+logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
 
 
 @dataclass
@@ -287,6 +292,92 @@ def compute_flow_grpo_outcome_advantage(
     return scores, scores
 
 
+# Policy-gradient losses that multiply ``rollout_is_weights`` into their per-element loss.
+GROUP_FILTER_LOSS_MODES = ("flow_grpo", "dance_grpo", "flow_dppo", "grpo_guard")
+
+
+def compute_zero_signal_group_uids(
+    scores: torch.Tensor,
+    uid: np.ndarray,
+    min_std: float = 0.0,
+    is_real: np.ndarray | None = None,
+) -> tuple[set[str], dict[str, float]]:
+    """Return the prompt uids whose reward population std is at most ``min_std``.
+
+    ``scores`` has one value per row and ``uid`` one uid per row. Rows marked
+    non-real (e.g. ``_balance_batch`` pad rows) are excluded from the group
+    statistics. Also returns per-call group counts for metrics.
+    """
+    num_rows = len(scores)
+    if is_real is None:
+        is_real = np.ones(num_rows, dtype=bool)
+    else:
+        is_real = np.asarray(is_real, dtype=bool)
+
+    dropped: set[str] = set()
+    num_groups = 0
+    num_kept_groups = 0
+    for group_uid in dict.fromkeys(uid[is_real]):
+        rows = np.flatnonzero((uid == group_uid) & is_real)
+        num_groups += 1
+        group_std = scores[torch.from_numpy(rows)].std(correction=0).item() if len(rows) > 1 else float("inf")
+        if group_std > min_std:
+            num_kept_groups += 1
+        else:
+            dropped.add(group_uid)
+    return dropped, {"num_groups": float(num_groups), "kept_groups": float(num_kept_groups)}
+
+
+def apply_diffusion_group_filter(data: DataProto, min_std: float = 0.0) -> tuple[DataProto, dict[str, float]]:
+    """DAPO dynamic sampling: drop rollout groups without a reward signal from the policy loss.
+
+    Rows sharing a prompt ``uid`` form a group. A group with more than one row whose
+    population std of ``sample_level_scores`` is at most ``min_std`` gets loss weight 0;
+    kept rows get ``len(data) / num_kept`` so the loss mean over all rows equals the mean
+    over kept rows. Pad rows marked ``_balance_is_pad`` are left out of the group
+    statistics and weighted 0. The weight is folded into ``rollout_is_weights``.
+
+    Dropped groups are not replaced here; the v1 sampler re-draws them when
+    ``filter_groups.refill_rounds > 0``. Must run after advantages are computed.
+    """
+    num_rows = len(data)
+    scores = data.batch["sample_level_scores"].reshape(num_rows, -1).float().mean(dim=-1)
+    uids = np.array(
+        [
+            str(uid.data) if hasattr(uid, "data") and not isinstance(uid, str) else str(uid)
+            for uid in data.non_tensor_batch["uid"]
+        ],
+        dtype=object,
+    )
+    is_pad = data.non_tensor_batch.get("_balance_is_pad", None)
+    is_real = None if is_pad is None else ~np.asarray(is_pad, dtype=bool)
+
+    dropped, group_stats = compute_zero_signal_group_uids(scores, uids, min_std=min_std, is_real=is_real)
+
+    keep = np.array([uids[i] not in dropped for i in range(num_rows)], dtype=bool)
+    if is_real is not None:
+        keep &= is_real
+    num_kept = int(keep.sum())
+    if num_kept == 0:
+        logger.warning("filter_groups dropped every rollout group in this batch; the policy loss is zero.")
+    advantages = data.batch["advantages"]
+    row_weights = torch.zeros(num_rows, dtype=advantages.dtype, device=advantages.device)
+    if num_kept > 0:
+        row_weights[torch.from_numpy(keep).to(advantages.device)] = num_rows / num_kept
+    weights = row_weights.view(num_rows, *([1] * (advantages.ndim - 1))).expand_as(advantages)
+    existing = data.batch.get("rollout_is_weights", None)
+    data.batch["rollout_is_weights"] = weights.clone() if existing is None else existing * weights.to(existing.dtype)
+
+    metrics = {
+        "training/filter_groups/num_groups": group_stats["num_groups"],
+        "training/filter_groups/kept_groups": group_stats["kept_groups"],
+        "training/filter_groups/kept_group_ratio": (
+            group_stats["kept_groups"] / group_stats["num_groups"] if group_stats["num_groups"] else 0.0
+        ),
+    }
+    return data, metrics
+
+
 @register_diffusion_loss("flow_grpo")
 @register_diffusion_loss("dance_grpo")
 class FlowGRPOLoss(DiffusionLossFn):
@@ -327,6 +418,11 @@ class FlowGRPOLoss(DiffusionLossFn):
         """
         assert config is not None, "config is required for FlowGRPOLoss!"
         loss_cfg = config.diffusion_loss
+        # DAPO clip-higher: decoupled bounds, each falling back to the symmetric clip_ratio.
+        clip_low = getattr(loss_cfg, "clip_ratio_low", None)
+        clip_high = getattr(loss_cfg, "clip_ratio_high", None)
+        clip_low = loss_cfg.clip_ratio if clip_low is None else clip_low
+        clip_high = loss_cfg.clip_ratio if clip_high is None else clip_high
         advantages = torch.clamp(
             advantages,
             -loss_cfg.adv_clip_max,
@@ -337,8 +433,8 @@ class FlowGRPOLoss(DiffusionLossFn):
         unclipped_loss = -advantages * ratio
         clipped_loss = -advantages * torch.clamp(
             ratio,
-            1.0 - loss_cfg.clip_ratio,
-            1.0 + loss_cfg.clip_ratio,
+            1.0 - clip_low,
+            1.0 + clip_high,
         )
         per_elem_loss = torch.maximum(unclipped_loss, clipped_loss)
         if rollout_is_weights is not None:
@@ -347,9 +443,9 @@ class FlowGRPOLoss(DiffusionLossFn):
 
         with torch.no_grad():
             ppo_kl = torch.mean(-log_ratio)
-            pg_clipfrac = torch.mean((torch.abs(ratio - 1.0) > loss_cfg.clip_ratio).float())
-            pg_clipfrac_higher = torch.mean((ratio - 1.0 > loss_cfg.clip_ratio).float())
-            pg_clipfrac_lower = torch.mean((1.0 - ratio > loss_cfg.clip_ratio).float())
+            pg_clipfrac_higher = torch.mean((ratio - 1.0 > clip_high).float())
+            pg_clipfrac_lower = torch.mean((1.0 - ratio > clip_low).float())
+            pg_clipfrac = pg_clipfrac_higher + pg_clipfrac_lower
             ratio_mean = ratio.mean()
             ratio_std = ratio.std()
 

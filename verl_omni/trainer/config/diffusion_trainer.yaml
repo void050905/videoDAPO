@@ -111,6 +111,21 @@ algorithm:
   # True for pair-based algorithms (e.g. offline DPO); doubles actor batch size and disables shuffle
   paired_preference: false
 
+  # DAPO dynamic-sampling group filter for policy-gradient losses
+  filter_groups:
+
+    # Required when using verl.utils.omega_conf_to_dataclass to instantiate dataclass configs
+    _target_: verl_omni.trainer.config.DiffusionFilterGroupsConfig
+
+    # Drop rollout groups without a reward signal from the policy loss
+    enable: false
+
+    # Groups whose population reward std is at most this value are dropped; 0.0 drops only exact ties
+    min_std: 0.0
+
+    # Re-draw replacements for dropped groups before training this step (0 disables; needs sampler.drop_incomplete_groups=true)
+    refill_rounds: 0
+
   # Rollout Correction (experimental).  Fields mirror RolloutCorrectionConfig.
   rollout_correction:
 

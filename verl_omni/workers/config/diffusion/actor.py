@@ -41,6 +41,9 @@ __all__ = [
 class DiffusionLossConfig(BaseConfig):
     loss_mode: str = "flow_grpo"
     clip_ratio: float = 0.0001
+    # Decoupled lower/upper ratio clip bounds (DAPO clip-higher); None falls back to clip_ratio.
+    clip_ratio_low: Optional[float] = None
+    clip_ratio_high: Optional[float] = None
     adv_clip_max: float = 5.0
     mix_beta: float = 0.5
     ref_kl_coef: float = 0.0
@@ -82,6 +85,10 @@ class DiffusionLossConfig(BaseConfig):
         ]
         if self.loss_mode not in valid_modes:
             raise ValueError(f"Invalid diffusion loss_mode: {self.loss_mode}. Must be one of {valid_modes}")
+        if self.clip_ratio_low is not None and not 0 < self.clip_ratio_low < 1:
+            raise ValueError(f"clip_ratio_low must be in (0, 1), got {self.clip_ratio_low}.")
+        if self.clip_ratio_high is not None and self.clip_ratio_high <= 0:
+            raise ValueError(f"clip_ratio_high must be positive, got {self.clip_ratio_high}.")
         if self.adv_clip_max <= 0:
             raise ValueError(f"Diffusion adv_clip_max must be positive, got {self.adv_clip_max}.")
         if self.mix_beta <= 0:

@@ -68,7 +68,12 @@ from verl_omni.pipelines.rollout_media import (
     validate_previews,
     validate_visual_media_batch_rank,
 )
-from verl_omni.trainer.diffusion.diffusion_algos import get_diffusion_loss_fn
+from verl_omni.trainer.diffusion.diffusion_algos import (
+    GROUP_FILTER_LOSS_MODES,
+    apply_diffusion_group_filter,
+    compute_zero_signal_group_uids,
+    get_diffusion_loss_fn,
+)
 from verl_omni.trainer.diffusion.diffusion_metric_utils import (
     compute_data_metrics_diffusion,
     compute_old_policy_metrics,
@@ -202,6 +207,23 @@ class PolicyGradientDiffusionTrainerV1(ABC):
         else:
             self._loss_fn = None
             self._has_old_adapter = False
+        filter_groups_cfg = config.algorithm.get("filter_groups", None)
+        self._filter_groups_enabled = bool(filter_groups_cfg is not None and filter_groups_cfg.get("enable", False))
+        if self._filter_groups_enabled and (self._is_direct_preference or loss_mode not in GROUP_FILTER_LOSS_MODES):
+            raise ValueError(
+                "algorithm.filter_groups.enable requires a policy-gradient loss_mode in "
+                f"{list(GROUP_FILTER_LOSS_MODES)}, got {loss_mode}."
+            )
+        self._filter_refill_rounds = (
+            int(filter_groups_cfg.get("refill_rounds", 0)) if filter_groups_cfg is not None else 0
+        )
+        if self._filter_refill_rounds > 0:
+            if not self._filter_groups_enabled:
+                raise ValueError("algorithm.filter_groups.refill_rounds>0 requires algorithm.filter_groups.enable=true")
+            if not config.trainer.v1.sampler.get("drop_incomplete_groups", False):
+                raise ValueError(
+                    "algorithm.filter_groups.refill_rounds>0 requires trainer.v1.sampler.drop_incomplete_groups=true"
+                )
         # DPO needs trainer-side ref noise preds even when KL is disabled.
         self.use_critic = False  # Diffusion has no critic worker group.
         self.use_reference_policy = need_reference_policy(config) or (loss_mode == "dpo")
@@ -655,6 +677,14 @@ class PolicyGradientDiffusionTrainerV1(ABC):
 
         with marked_timer("adv", timing_raw, color="brown"):
             data = self._compute_advantage(data)
+
+        # DAPO dynamic sampling: zero-weight groups without reward signal. Reads the
+        # _balance_batch pad marker, so it must run before _zero_pad_row_advantages pops it.
+        if self._filter_groups_enabled:
+            data, filter_metrics = apply_diffusion_group_filter(
+                data, min_std=self.config.algorithm.filter_groups.get("min_std", 0.0)
+            )
+            metrics.update(filter_metrics)
 
         # Zero advantages of rows appended by _balance_batch so the unmasked
         # FlowGRPO loss mean is not corrupted by duplicated real advantages.
@@ -1299,7 +1329,9 @@ class PolicyGradientDiffusionTrainerV1(ABC):
             # or writes these keys (TQ key order is storage-arbitrary).
             return canonicalize_diffusion_tq_meta(batch_meta), off_policy_metrics
 
-        max_refill_rounds = sampler_config.get("max_incomplete_group_refill_rounds", 3)
+        max_refill_rounds = max(
+            sampler_config.get("max_incomplete_group_refill_rounds", 3), getattr(self, "_filter_refill_rounds", 0)
+        )
         remaining_batch_size = batch_size
         refill_rounds = 0
         keys: list[str] = []
@@ -1331,41 +1363,72 @@ class PolicyGradientDiffusionTrainerV1(ABC):
             )
             selected_uids = set(sampleable_uids[:remaining_batch_size])
             failed_uids = selected_uids & self.replay_buffer.failure_keys["train"]
-            if not failed_uids:
+            bad_uids = failed_uids
+            filter_metrics: dict = {}
+            if getattr(self, "_filter_refill_rounds", 0) > 0 and len(batch.keys) > 0:
+                # Rewards are already on the rows at sampling time; convert without
+                # the training payload and re-draw groups whose reward signal is flat.
+                probe = diffusion_tq_batch_to_dataproto(batch, pad_token_id=self.tokenizer.pad_token_id or 0)
+                reward_tensor, _ = extract_reward(probe)
+                row_scores = reward_tensor.reshape(len(probe), -1).float().mean(dim=-1)
+                probe_uids = np.array(
+                    [
+                        str(uid.data) if hasattr(uid, "data") and not isinstance(uid, str) else str(uid)
+                        for uid in probe.non_tensor_batch["uid"]
+                    ],
+                    dtype=object,
+                )
+                filtered, filter_metrics = compute_zero_signal_group_uids(
+                    row_scores,
+                    probe_uids,
+                    min_std=self.config.algorithm.filter_groups.get("min_std", 0.0),
+                )
+                bad_uids = failed_uids | filtered
+                sampling_metrics.update({f"training/filter_groups/{k}": v for k, v in filter_metrics.items()})
+
+            if not bad_uids:
                 keys.extend(batch.keys)
                 tags.extend(batch.tags)
                 break
 
             if refill_rounds >= max_refill_rounds:
+                if bad_uids - failed_uids:
+                    raise RuntimeError(
+                        f"Exceeded max refill rounds={max_refill_rounds} while replacing bad rollout groups "
+                        f"({len(failed_uids)} failed, {len(bad_uids - failed_uids)} zero-signal)"
+                    )
                 raise RuntimeError(
                     f"Exceeded max_incomplete_group_refill_rounds={max_refill_rounds} "
                     "while replacing failed rollout groups"
                 )
 
-            num_failed = len(failed_uids)
+            num_bad = len(bad_uids)
             for key, tag in zip(batch.keys, batch.tags, strict=False):
-                if self._trajectory_uid(key) not in failed_uids:
+                if self._trajectory_uid(key) not in bad_uids:
                     keys.append(key)
                     tags.append(tag)
 
-            failed_trajectory_keys = [
-                key for key in self.replay_buffer.partitions["train"] if self._trajectory_uid(key) in failed_uids
+            bad_trajectory_keys = [
+                key for key in self.replay_buffer.partitions["train"] if self._trajectory_uid(key) in bad_uids
             ]
-            tq.kv_clear(partition_id="train", keys=[*failed_uids, *failed_trajectory_keys])
+            tq.kv_clear(partition_id="train", keys=[*bad_uids, *bad_trajectory_keys])
 
-            refilled = self._add_prompts_to_generate(num_failed)
-            if refilled != num_failed:
-                raise RuntimeError(f"refill submitted {refilled} prompts, expected {num_failed}")
+            refilled = self._add_prompts_to_generate(num_bad)
+            if refilled != num_bad:
+                raise RuntimeError(f"refill submitted {refilled} prompts, expected {num_bad}")
 
             refill_rounds += 1
-            remaining_batch_size = num_failed
-            failure_metrics["training/rollout_failure/evicted_groups"] += num_failed
-            failure_metrics["training/rollout_failure/evicted_trajectories"] += len(failed_trajectory_keys)
+            remaining_batch_size = num_bad
+            failure_metrics["training/rollout_failure/evicted_groups"] += num_bad
+            failure_metrics["training/rollout_failure/evicted_trajectories"] += len(bad_trajectory_keys)
             failure_metrics["training/rollout_failure/refilled_prompts"] += refilled
             failure_metrics["training/rollout_failure/refill_rounds"] += 1
             logger.warning(
-                "Evicted %d incomplete rollout groups and submitted exact replacements (round %d/%d)",
-                num_failed,
+                "Evicted %d bad rollout groups (%d failed, %d zero-signal) and submitted "
+                "exact replacements (round %d/%d)",
+                num_bad,
+                len(failed_uids),
+                len(bad_uids - failed_uids),
                 refill_rounds,
                 max_refill_rounds,
             )

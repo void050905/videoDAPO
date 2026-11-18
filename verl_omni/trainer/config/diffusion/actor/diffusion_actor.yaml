@@ -47,6 +47,12 @@ diffusion_loss:
   # PPO clip ratio
   clip_ratio: 0.0001
 
+  # Lower ratio clip bound for FlowGRPO (DAPO clip-higher); null falls back to clip_ratio
+  clip_ratio_low: null
+
+  # Upper ratio clip bound for FlowGRPO (DAPO clip-higher); null falls back to clip_ratio
+  clip_ratio_high: null
+
   # Maximum value to clamp advantages before computing policy loss
   adv_clip_max: 5.0
 

@@ -1023,3 +1023,93 @@ def test_dance_grpo_advantage_return(norm_adv_by_std_in_grpo: bool, global_std: 
     )
 
     assert advantages.shape == returns.shape == (batch_size, steps)
+
+
+def _flow_grpo_actor_config(**loss_overrides):
+    return DiffusionActorConfig(
+        strategy="fsdp2",
+        rollout_n=1,
+        diffusion_loss=DiffusionLossConfig(loss_mode="flow_grpo", adv_clip_max=5.0, **loss_overrides),
+    )
+
+
+def test_flow_grpo_clip_higher_uses_decoupled_bounds() -> None:
+    old_log_prob = torch.zeros(4)
+    # ratios 1.25 (A>0), 0.75 (A<0), 1.25 (A<0), 0.75 (A>0)
+    log_prob = torch.log(torch.tensor([1.25, 0.75, 1.25, 0.75]))
+    advantages = torch.tensor([1.0, -1.0, -1.0, 1.0])
+    loss_fn = diffusion_algos.get_diffusion_loss_fn("flow_grpo")
+
+    config = _flow_grpo_actor_config(clip_ratio=0.2, clip_ratio_low=0.1, clip_ratio_high=0.3)
+    loss, metrics = loss_fn.compute_loss(
+        old_log_prob=old_log_prob, log_prob=log_prob, advantages=advantages, config=config
+    )
+    ratio = torch.exp(log_prob)
+    expected = torch.maximum(-advantages * ratio, -advantages * torch.clamp(ratio, 0.9, 1.3)).mean()
+    torch.testing.assert_close(loss, expected)
+    # 1.25 stays inside the 0.3 upper bound; 0.75 falls below the 0.1 lower bound.
+    assert metrics["actor/pg_clipfrac_higher"] == pytest.approx(0.0)
+    assert metrics["actor/pg_clipfrac_lower"] == pytest.approx(0.5)
+    assert metrics["actor/pg_clipfrac"] == pytest.approx(0.5)
+
+    symmetric = _flow_grpo_actor_config(clip_ratio=0.2)
+    explicit = _flow_grpo_actor_config(clip_ratio=0.2, clip_ratio_low=0.2, clip_ratio_high=0.2)
+    loss_symmetric, metrics_symmetric = loss_fn.compute_loss(
+        old_log_prob=old_log_prob, log_prob=log_prob, advantages=advantages, config=symmetric
+    )
+    loss_explicit, _ = loss_fn.compute_loss(
+        old_log_prob=old_log_prob, log_prob=log_prob, advantages=advantages, config=explicit
+    )
+    torch.testing.assert_close(loss_symmetric, loss_explicit)
+    assert metrics_symmetric["actor/pg_clipfrac"] == pytest.approx(1.0)
+
+
+@pytest.mark.parametrize("overrides", [{"clip_ratio_low": 0.0}, {"clip_ratio_low": 1.0}, {"clip_ratio_high": 0.0}])
+def test_flow_grpo_clip_higher_rejects_invalid_bounds(overrides) -> None:
+    with pytest.raises(ValueError, match="clip_ratio_"):
+        DiffusionLossConfig(loss_mode="flow_grpo", **overrides)
+
+
+def test_diffusion_group_filter_drops_no_signal_groups() -> None:
+    from verl import DataProto
+
+    from verl_omni.trainer.config import DiffusionFilterGroupsConfig
+
+    steps = 3
+    # Groups: a has a constant reward (dropped), b and c are kept; the last row pads a copy of a b row.
+    uid = np.array(["a", "a", "b", "b", "c", "c", "b"], dtype=object)
+    scores = torch.tensor([[0.5], [0.5], [0.1], [0.9], [0.2], [0.4], [0.1]])
+    advantages = torch.randn(len(uid), steps)
+    data = DataProto.from_dict(
+        tensors={"sample_level_scores": scores, "advantages": advantages.clone()},
+        non_tensors={"uid": uid, "_balance_is_pad": np.array([False] * 6 + [True])},
+    )
+
+    data, metrics = diffusion_algos.apply_diffusion_group_filter(data, min_std=0.0)
+
+    weights = data.batch["rollout_is_weights"]
+    expected = torch.tensor([0.0, 0.0, 7 / 4, 7 / 4, 7 / 4, 7 / 4, 0.0])
+    torch.testing.assert_close(weights, expected[:, None].expand_as(advantages))
+    assert metrics["training/filter_groups/num_groups"] == 3
+    assert metrics["training/filter_groups/kept_groups"] == 2
+    # The weighted mean over all rows equals the plain mean over kept rows.
+    per_elem = torch.randn(len(uid), steps)
+    torch.testing.assert_close((per_elem * weights).mean(), per_elem[2:6].mean())
+    # The pad marker stays for _zero_pad_row_advantages.
+    assert "_balance_is_pad" in data.non_tensor_batch
+
+    # min_std=0.2 also drops c (population std 0.1) but keeps b (0.4); existing weights are multiplied.
+    data = DataProto.from_dict(
+        tensors={
+            "sample_level_scores": scores[:6],
+            "advantages": advantages[:6].clone(),
+            "rollout_is_weights": torch.full((6, steps), 0.5),
+        },
+        non_tensors={"uid": uid[:6]},
+    )
+    data, _ = diffusion_algos.apply_diffusion_group_filter(data, min_std=0.2)
+    expected = 0.5 * torch.tensor([0.0, 0.0, 3.0, 3.0, 0.0, 0.0])
+    torch.testing.assert_close(data.batch["rollout_is_weights"], expected[:, None].expand(6, steps))
+
+    with pytest.raises(ValueError, match="min_std"):
+        DiffusionFilterGroupsConfig(enable=True, min_std=-1.0)
